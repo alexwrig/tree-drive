@@ -321,6 +321,24 @@
     ::-webkit-scrollbar { width: 5px; }
     ::-webkit-scrollbar-track { background: var(--bg2); }
     ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+
+    /* ─── MAP CONTROLS ───────────────────────────────────────────────────────── */
+    .map-controls {
+      position: absolute; bottom: 16px; left: 16px; z-index: 400;
+      display: flex; flex-direction: column; gap: 8px;
+    }
+    .map-ctrl-btn {
+      background: var(--bg2); border: 1px solid var(--border); color: var(--text-muted);
+      border-radius: 10px; padding: 9px 12px; cursor: pointer;
+      box-shadow: 0 2px 8px rgba(0,0,0,.5); touch-action: manipulation;
+      display: flex; align-items: center; gap: 6px;
+      font-size: 12px; font-weight: 700; white-space: nowrap;
+      transition: background 0.15s, color 0.15s, border-color 0.15s;
+    }
+    .map-ctrl-btn .ci { font-size: 15px; }
+    .map-ctrl-btn.active { background: var(--orange); border-color: var(--orange-dark); color: #fff; }
+    .map-ctrl-btn:active { filter: brightness(0.88); }
+    @media (max-width: 640px) { .map-controls { bottom: 70px; } }
   </style>
 </head>
 <body>
@@ -356,8 +374,20 @@
   <div class="map-wrap">
     <div id="map"></div>
     <div class="map-hint" id="mapHint">Tap map to spot a tree 🌲</div>
-    <button class="locate-fab" onclick="locateUser()" title="My location">📍</button>
+    <button class="locate-fab" onclick="snapToMe()" title="Re-center on my location">📍</button>
     <button class="list-fab" id="listFab" onclick="toggleSheet()" style="display:none;">📋</button>
+    <!-- Left-side map controls -->
+    <div class="map-controls">
+      <button class="map-ctrl-btn active" id="followBtn" onclick="toggleFollow()" title="Toggle map follow">
+        <span class="ci">🔒</span><span id="followLbl">Follow</span>
+      </button>
+      <button class="map-ctrl-btn" id="trailBtn" onclick="toggleBreadcrumb()" title="Toggle trail recording">
+        <span class="ci">🦶</span><span id="trailLbl">Trail</span>
+      </button>
+      <button class="map-ctrl-btn" id="clearTrailBtn" onclick="clearBreadcrumb()" title="Clear trail" style="display:none;">
+        <span class="ci">🗑</span><span>Clear</span>
+      </button>
+    </div>
   </div>
 
   <div class="crew-panel hidden" id="crewPanel">
@@ -459,6 +489,16 @@ let activeId = null;
 let mobileSheetOpen = false;
 const isMobile = () => window.innerWidth <= 640;
 
+// location / follow / breadcrumb state
+let watchId = null;
+let followMode = true;
+let firstFix = true;
+let breadcrumbActive = false;
+let breadcrumbs = [];      // [{lat,lng,ts}]
+let breadcrumbLine = null;
+let breadcrumbDots = [];
+const CRUMB_MIN_FT = 25;   // min feet between recorded points
+
 // ─── API HELPERS ──────────────────────────────────────────────────────────────
 async function api(method, path, body) {
   const opts = { method, headers: { 'Content-Type': 'application/json' } };
@@ -525,24 +565,129 @@ function initMap() {
     pendingLng = e.latlng.lng;
     openAdd(pendingLat, pendingLng);
   });
-  locateUser(true);
+  // Disable follow when user manually pans
+  map.on('dragstart', () => setFollow(false));
+  startTracking();
 }
 
-function locateUser(fly) {
-  if (!navigator.geolocation) return;
-  navigator.geolocation.getCurrentPosition(pos => {
-    userLat = pos.coords.latitude;
-    userLng = pos.coords.longitude;
-    if (userMarker) userMarker.remove();
-    userMarker = L.marker([userLat, userLng], {
-      icon: L.divIcon({
-        html: `<div style="width:16px;height:16px;background:#4fc3f7;border:3px solid #fff;border-radius:50%;box-shadow:0 0 8px rgba(79,195,247,.7);"></div>`,
-        iconSize: [16,16], iconAnchor: [8,8], className: ''
-      }), zIndexOffset: 1000
-    }).addTo(map).bindPopup('📍 You are here');
-    if (fly) map.setView([userLat, userLng], 14);
-    renderList();
-  }, () => {});
+// ─── LOCATION TRACKING ────────────────────────────────────────────────────────
+function startTracking() {
+  if (!navigator.geolocation || watchId !== null) return;
+  watchId = navigator.geolocation.watchPosition(
+    onPositionUpdate,
+    () => {},
+    { enableHighAccuracy: true, maximumAge: 3000, timeout: 15000 }
+  );
+}
+
+function onPositionUpdate(pos) {
+  userLat = pos.coords.latitude;
+  userLng = pos.coords.longitude;
+
+  // Update the blue dot
+  if (userMarker) userMarker.remove();
+  userMarker = L.marker([userLat, userLng], {
+    icon: L.divIcon({
+      html: `<div style="width:16px;height:16px;background:#4fc3f7;border:3px solid #fff;border-radius:50%;box-shadow:0 0 8px rgba(79,195,247,.7);"></div>`,
+      iconSize: [16,16], iconAnchor: [8,8], className: ''
+    }), zIndexOffset: 1000
+  }).addTo(map).bindPopup('📍 You are here');
+
+  // Fly on first fix, pan on subsequent fixes if following
+  if (firstFix) {
+    map.setView([userLat, userLng], 15);
+    firstFix = false;
+  } else if (followMode) {
+    map.panTo([userLat, userLng]);
+  }
+
+  if (breadcrumbActive) addBreadcrumb(userLat, userLng);
+  renderList();
+}
+
+// Locate FAB — snap back to user and re-enable follow
+function snapToMe() {
+  setFollow(true);
+  if (userLat !== null) map.setView([userLat, userLng], Math.max(map.getZoom(), 15));
+}
+
+// Keep old name for any lingering calls
+function locateUser() { snapToMe(); }
+
+// ─── FOLLOW MODE ──────────────────────────────────────────────────────────────
+function toggleFollow() { setFollow(!followMode); }
+
+function setFollow(on) {
+  followMode = on;
+  const btn = document.getElementById('followBtn');
+  btn.classList.toggle('active', on);
+  btn.querySelector('.ci').textContent  = on ? '🔒' : '🔓';
+  document.getElementById('followLbl').textContent = on ? 'Follow' : 'Follow';
+  if (on && userLat !== null) map.panTo([userLat, userLng]);
+}
+
+// ─── BREADCRUMB ────────────────────────────────────────────────────────────────
+function toggleBreadcrumb() {
+  breadcrumbActive = !breadcrumbActive;
+  const btn = document.getElementById('trailBtn');
+  btn.classList.toggle('active', breadcrumbActive);
+  btn.querySelector('.ci').textContent = breadcrumbActive ? '🟠' : '🦶';
+  document.getElementById('trailLbl').textContent = breadcrumbActive ? 'Trail ON' : 'Trail';
+  toast(breadcrumbActive ? '🦶 Trail recording…' : '⏸ Trail paused');
+}
+
+function addBreadcrumb(lat, lng) {
+  if (breadcrumbs.length > 0) {
+    const last = breadcrumbs[breadcrumbs.length - 1];
+    if (dist(lat, lng, last.lat, last.lng) * 5280 < CRUMB_MIN_FT) return;
+  }
+  breadcrumbs.push({ lat, lng, ts: Date.now() });
+  try { localStorage.setItem('td_crumbs', JSON.stringify(breadcrumbs)); } catch {}
+  renderBreadcrumb();
+}
+
+function renderBreadcrumb() {
+  if (breadcrumbLine) { breadcrumbLine.remove(); breadcrumbLine = null; }
+  breadcrumbDots.forEach(d => d.remove());
+  breadcrumbDots = [];
+
+  if (breadcrumbs.length < 1) {
+    document.getElementById('clearTrailBtn').style.display = 'none';
+    return;
+  }
+  document.getElementById('clearTrailBtn').style.display = '';
+
+  const coords = breadcrumbs.map(b => [b.lat, b.lng]);
+  if (coords.length >= 2) {
+    breadcrumbLine = L.polyline(coords, {
+      color: '#f4831f', weight: 3, opacity: 0.85, dashArray: '8, 5'
+    }).addTo(map);
+  }
+
+  // Dots: subsample to max 60 + always show first & last
+  const step = Math.max(1, Math.floor(breadcrumbs.length / 60));
+  breadcrumbs.forEach((b, i) => {
+    const isLast = i === breadcrumbs.length - 1;
+    if (i % step !== 0 && !isLast) return;
+    breadcrumbDots.push(
+      L.circleMarker([b.lat, b.lng], {
+        radius: isLast ? 5 : 3,
+        color: '#f4831f',
+        fillColor: isLast ? '#f4831f' : '#fff',
+        fillOpacity: 1,
+        weight: 2,
+        interactive: false,
+      }).addTo(map)
+    );
+  });
+}
+
+function clearBreadcrumb() {
+  if (!confirm('Clear your trail?')) return;
+  breadcrumbs = [];
+  try { localStorage.removeItem('td_crumbs'); } catch {}
+  renderBreadcrumb();
+  toast('Trail cleared');
 }
 
 // ─── ICONS ────────────────────────────────────────────────────────────────────
@@ -794,7 +939,7 @@ function setRole(r) {
     hint.style.opacity = '0';
     fab.style.display = 'flex';
     if (!isMobile()) { panel.classList.remove('hidden'); mobileSheetOpen = true; }
-    renderList(); locateUser(false);
+    renderList();
   } else {
     hint.style.opacity = '1';
     fab.style.display = 'none';
@@ -879,6 +1024,11 @@ window.addEventListener('resize', () => {
 initMap();
 syncTrees();
 setInterval(syncTrees, 5000);
+// Restore saved trail
+try {
+  const saved = localStorage.getItem('td_crumbs');
+  if (saved) { breadcrumbs = JSON.parse(saved); renderBreadcrumb(); }
+} catch {}
 const savedRole = localStorage.getItem('td_role') || 'spotter';
 setRole(savedRole);
 </script>
