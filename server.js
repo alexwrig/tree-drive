@@ -1,0 +1,155 @@
+const express = require('express');
+const { Pool } = require('pg');
+const { WebSocketServer } = require('ws');
+const http = require('http');
+const path = require('path');
+
+const PORT = process.env.PORT || 8000;
+const app = express();
+const server = http.createServer(app);
+const wss = new WebSocketServer({ server });
+
+// ─── DATABASE ─────────────────────────────────────────────────────────────────
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: process.env.DATABASE_URL ? { rejectUnauthorized: false } : false,
+});
+
+async function initDb() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS trees (
+      id          TEXT    PRIMARY KEY,
+      lat         DOUBLE PRECISION NOT NULL,
+      lng         DOUBLE PRECISION NOT NULL,
+      address     TEXT    NOT NULL,
+      trees       INTEGER NOT NULL DEFAULT 1,
+      size        TEXT    NOT NULL DEFAULT 'medium',
+      notes       TEXT    DEFAULT '',
+      spotter     TEXT    DEFAULT '',
+      status      TEXT    NOT NULL DEFAULT 'available',
+      "claimedAt"  BIGINT,
+      "pickedUpAt" BIGINT,
+      "createdAt"  BIGINT NOT NULL
+    )
+  `);
+  console.log('Database ready.');
+}
+
+// ─── WEBSOCKET ────────────────────────────────────────────────────────────────
+function broadcast(msg) {
+  const data = JSON.stringify(msg);
+  wss.clients.forEach(c => { if (c.readyState === 1) c.send(data); });
+}
+
+wss.on('connection', async ws => {
+  const { rows } = await pool.query('SELECT * FROM trees ORDER BY "createdAt" DESC');
+  ws.send(JSON.stringify({ type: 'init', trees: rows }));
+});
+
+// ─── MIDDLEWARE ───────────────────────────────────────────────────────────────
+app.use(express.json({ limit: '4mb' }));
+app.use(express.static(path.join(__dirname, 'public')));
+
+// ─── API ──────────────────────────────────────────────────────────────────────
+
+app.get('/api/trees', async (_req, res) => {
+  const { rows } = await pool.query('SELECT * FROM trees ORDER BY "createdAt" DESC');
+  res.json(rows);
+});
+
+app.post('/api/trees', async (req, res) => {
+  const t = sanitize(req.body);
+  if (!t) return res.status(400).json({ error: 'Invalid tree data' });
+  await pool.query(
+    `INSERT INTO trees (id,lat,lng,address,trees,size,notes,spotter,status,"claimedAt","pickedUpAt","createdAt")
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
+    [t.id, t.lat, t.lng, t.address, t.trees, t.size, t.notes, t.spotter,
+     t.status, t.claimedAt, t.pickedUpAt, t.createdAt]
+  );
+  broadcast({ type: 'create', tree: t });
+  res.status(201).json(t);
+});
+
+app.patch('/api/trees/:id', async (req, res) => {
+  const { rows: existing } = await pool.query('SELECT id FROM trees WHERE id = $1', [req.params.id]);
+  if (!existing.length) return res.status(404).json({ error: 'Not found' });
+
+  const allowed = ['status','claimedAt','pickedUpAt','address','trees','size','notes','spotter'];
+  const updates = {};
+  for (const k of allowed) { if (k in req.body) updates[k] = req.body[k]; }
+  if (!Object.keys(updates).length) return res.status(400).json({ error: 'No valid fields' });
+
+  const keys = Object.keys(updates);
+  const fields = keys.map((k, i) => `"${k}" = $${i + 1}`).join(', ');
+  const vals = [...Object.values(updates), req.params.id];
+  await pool.query(`UPDATE trees SET ${fields} WHERE id = $${keys.length + 1}`, vals);
+
+  const { rows } = await pool.query('SELECT * FROM trees WHERE id = $1', [req.params.id]);
+  broadcast({ type: 'update', tree: rows[0] });
+  res.json(rows[0]);
+});
+
+app.delete('/api/trees', async (req, res) => {
+  if (req.query.status !== 'picked_up') return res.status(400).json({ error: 'Only status=picked_up supported' });
+  await pool.query("DELETE FROM trees WHERE status = 'picked_up'");
+  broadcast({ type: 'clearLoaded' });
+  res.json({ ok: true });
+});
+
+app.delete('/api/trees/:id', async (req, res) => {
+  await pool.query('DELETE FROM trees WHERE id = $1', [req.params.id]);
+  broadcast({ type: 'delete', id: req.params.id });
+  res.json({ ok: true });
+});
+
+app.post('/api/trees/bulk', async (req, res) => {
+  const incoming = req.body;
+  if (!Array.isArray(incoming)) return res.status(400).json({ error: 'Expected array' });
+
+  let count = 0;
+  for (const row of incoming) {
+    const t = sanitize(row);
+    if (!t) continue;
+    const result = await pool.query(
+      `INSERT INTO trees (id,lat,lng,address,trees,size,notes,spotter,status,"claimedAt","pickedUpAt","createdAt")
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+       ON CONFLICT (id) DO NOTHING`,
+      [t.id, t.lat, t.lng, t.address, t.trees, t.size, t.notes, t.spotter,
+       t.status, t.claimedAt, t.pickedUpAt, t.createdAt]
+    );
+    if (result.rowCount) count++;
+  }
+
+  const { rows: all } = await pool.query('SELECT * FROM trees ORDER BY "createdAt" DESC');
+  broadcast({ type: 'init', trees: all });
+  res.json({ imported: count, total: all.length });
+});
+
+// ─── HELPERS ──────────────────────────────────────────────────────────────────
+function sanitize(b) {
+  if (!b || !b.id || b.lat == null || b.lng == null || !b.address) return null;
+  return {
+    id:        String(b.id).slice(0, 32),
+    lat:       parseFloat(b.lat),
+    lng:       parseFloat(b.lng),
+    address:   String(b.address).slice(0, 200),
+    trees:     Math.min(Math.max(parseInt(b.trees) || 1, 1), 999),
+    size:      ['small','medium','large'].includes(b.size) ? b.size : 'medium',
+    notes:     String(b.notes || '').slice(0, 500),
+    spotter:   String(b.spotter || '').slice(0, 20),
+    status:    ['available','claimed','picked_up'].includes(b.status) ? b.status : 'available',
+    claimedAt:  b.claimedAt  ? parseInt(b.claimedAt)  : null,
+    pickedUpAt: b.pickedUpAt ? parseInt(b.pickedUpAt) : null,
+    createdAt:  b.createdAt  ? parseInt(b.createdAt)  : Date.now(),
+  };
+}
+
+// ─── START ────────────────────────────────────────────────────────────────────
+initDb().then(() => {
+  server.listen(PORT, () => {
+    console.log(`\n🌲 Tree Drive running at http://localhost:${PORT}\n`);
+  });
+}).catch(err => {
+  console.error('Database init failed:', err.message);
+  process.exit(1);
+});

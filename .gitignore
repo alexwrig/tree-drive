@@ -1,0 +1,5 @@
+node_modules/
+trees.db
+*.db-shm
+*.db-wal
+.env

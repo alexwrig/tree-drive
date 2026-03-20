@@ -1,0 +1,14 @@
+{
+  "name": "tree-drive",
+  "version": "1.0.0",
+  "description": "Boy Scout tree pickup field app",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "pg": "^8.20.0",
+    "ws": "^8.16.0"
+  }
+}

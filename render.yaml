@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: tree-drive
+    env: node
+    plan: free
+    buildCommand: npm install
+    startCommand: node server.js
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: tree-drive-db
+          property: connectionString
+      - key: NODE_ENV
+        value: production
+
+databases:
+  - name: tree-drive-db
+    plan: free
