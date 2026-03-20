@@ -451,7 +451,7 @@
 // ─── STATE ────────────────────────────────────────────────────────────────────
 let trees = [];
 let role = 'spotter';
-let map, userMarker, ws;
+let map, userMarker;
 let userLat = null, userLng = null;
 let pendingLat = null, pendingLng = null;
 let markers = {};
@@ -468,50 +468,47 @@ async function api(method, path, body) {
   return r.json();
 }
 
-// ─── WEBSOCKET ────────────────────────────────────────────────────────────────
-function connectWS() {
-  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-  ws = new WebSocket(`${proto}://${location.host}`);
+// ─── POLLING ──────────────────────────────────────────────────────────────────
+async function syncTrees() {
+  try {
+    const fresh = await api('GET', '/api/trees');
 
-  ws.onopen = () => setConn(true);
-  ws.onclose = () => { setConn(false); setTimeout(connectWS, 3000); };
+    // Diff against local state — update only what changed (avoids marker flicker)
+    let changed = false;
 
-  ws.onmessage = e => {
-    const msg = JSON.parse(e.data);
-    if (msg.type === 'init') {
-      trees = msg.trees;
-      renderMarkers(); renderList(); updateStats();
-    } else if (msg.type === 'create') {
-      if (!trees.find(t => t.id === msg.tree.id)) {
-        trees.unshift(msg.tree);
-        addMarker(msg.tree);
-        renderList(); updateStats();
-        toast(`🌲 New tree spotted — ${msg.tree.address}`);
+    for (const t of fresh) {
+      const i = trees.findIndex(x => x.id === t.id);
+      if (i === -1) {
+        trees.unshift(t);
+        addMarker(t);
+        changed = true;
+      } else if (trees[i].status !== t.status) {
+        trees[i] = t;
+        refreshMarker(t.id);
+        changed = true;
       }
-    } else if (msg.type === 'update') {
-      const i = trees.findIndex(t => t.id === msg.tree.id);
-      if (i >= 0) { trees[i] = msg.tree; refreshMarker(msg.tree.id); }
-      renderList(); updateStats();
-      if (activeId === msg.tree.id) buildDetailActions(msg.tree);
-    } else if (msg.type === 'delete') {
-      if (markers[msg.id]) { markers[msg.id].remove(); delete markers[msg.id]; }
-      trees = trees.filter(t => t.id !== msg.id);
-      renderList(); updateStats();
-      if (activeId === msg.id) closeDetail();
-    } else if (msg.type === 'clearLoaded') {
-      trees.filter(t => t.status === 'picked_up').forEach(t => {
-        if (markers[t.id]) { markers[t.id].remove(); delete markers[t.id]; }
-      });
-      trees = trees.filter(t => t.status !== 'picked_up');
-      renderList(); updateStats();
     }
-  };
+    // Remove trees deleted on another device
+    for (const t of [...trees]) {
+      if (!fresh.find(x => x.id === t.id)) {
+        if (markers[t.id]) { markers[t.id].remove(); delete markers[t.id]; }
+        trees = trees.filter(x => x.id !== t.id);
+        if (activeId === t.id) closeDetail();
+        changed = true;
+      }
+    }
+
+    if (changed) { renderList(); updateStats(); }
+    setConn(true);
+  } catch {
+    setConn(false);
+  }
 }
 
 function setConn(live) {
   const dot = document.getElementById('connDot');
   dot.classList.toggle('live', live);
-  dot.title = live ? 'Live — synced with server' : 'Disconnected — reconnecting…';
+  dot.title = live ? 'Synced' : 'Disconnected — retrying…';
 }
 
 // ─── MAP INIT ─────────────────────────────────────────────────────────────────
@@ -880,7 +877,8 @@ window.addEventListener('resize', () => {
 
 // ─── BOOT ─────────────────────────────────────────────────────────────────────
 initMap();
-connectWS();
+syncTrees();
+setInterval(syncTrees, 5000);
 const savedRole = localStorage.getItem('td_role') || 'spotter';
 setRole(savedRole);
 </script>

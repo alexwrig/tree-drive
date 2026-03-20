@@ -2,7 +2,7 @@
   "name": "tree-drive",
   "version": "1.0.0",
   "description": "Boy Scout tree pickup field app",
-  "main": "server.js",
+  "main": "api/index.js",
   "scripts": {
     "start": "node server.js"
   },
