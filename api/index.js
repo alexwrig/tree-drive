@@ -1,5 +1,6 @@
 const express = require('express');
 const { Pool } = require('pg');
+const path = require('path');
 
 const app = express();
 app.use(express.json({ limit: '4mb' }));
@@ -110,6 +111,11 @@ app.post('/api/trees/bulk', wrap(async (req, res) => {
   }
   res.json({ imported: count });
 }));
+
+// Serve the frontend for all non-API routes
+app.get('*', (_req, res) => {
+  res.sendFile(path.join(__dirname, '../index.html'));
+});
 
 // Global error handler — returns JSON instead of crashing
 app.use((err, _req, res, _next) => {
