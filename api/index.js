@@ -5,10 +5,15 @@ const app = express();
 app.use(express.json({ limit: '4mb' }));
 
 // ─── DATABASE ─────────────────────────────────────────────────────────────────
+if (!process.env.DATABASE_URL) {
+  console.error('ERROR: DATABASE_URL environment variable is not set.');
+}
+
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false },
-  max: 3, // keep pool small for serverless
+  max: 3,
+  connectionTimeoutMillis: 5000,
 });
 
 let initialized = false;
@@ -33,14 +38,17 @@ async function ensureDb() {
   initialized = true;
 }
 
+// Wrap async route handlers so Express catches rejections
+const wrap = fn => (req, res, next) => fn(req, res, next).catch(next);
+
 // ─── ROUTES ───────────────────────────────────────────────────────────────────
-app.get('/api/trees', async (_req, res) => {
+app.get('/api/trees', wrap(async (_req, res) => {
   await ensureDb();
   const { rows } = await pool.query('SELECT * FROM trees ORDER BY "createdAt" DESC');
   res.json(rows);
-});
+}));
 
-app.post('/api/trees', async (req, res) => {
+app.post('/api/trees', wrap(async (req, res) => {
   await ensureDb();
   const t = sanitize(req.body);
   if (!t) return res.status(400).json({ error: 'Invalid tree data' });
@@ -51,9 +59,9 @@ app.post('/api/trees', async (req, res) => {
      t.status, t.claimedAt, t.pickedUpAt, t.createdAt]
   );
   res.status(201).json(t);
-});
+}));
 
-app.patch('/api/trees/:id', async (req, res) => {
+app.patch('/api/trees/:id', wrap(async (req, res) => {
   await ensureDb();
   const allowed = ['status','claimedAt','pickedUpAt','address','trees','size','notes','spotter'];
   const updates = {};
@@ -69,22 +77,22 @@ app.patch('/api/trees/:id', async (req, res) => {
   const { rows } = await pool.query('SELECT * FROM trees WHERE id = $1', [req.params.id]);
   if (!rows.length) return res.status(404).json({ error: 'Not found' });
   res.json(rows[0]);
-});
+}));
 
-app.delete('/api/trees', async (req, res) => {
+app.delete('/api/trees', wrap(async (req, res) => {
   await ensureDb();
   if (req.query.status !== 'picked_up') return res.status(400).json({ error: 'Only status=picked_up supported' });
   await pool.query("DELETE FROM trees WHERE status = 'picked_up'");
   res.json({ ok: true });
-});
+}));
 
-app.delete('/api/trees/:id', async (req, res) => {
+app.delete('/api/trees/:id', wrap(async (req, res) => {
   await ensureDb();
   await pool.query('DELETE FROM trees WHERE id = $1', [req.params.id]);
   res.json({ ok: true });
-});
+}));
 
-app.post('/api/trees/bulk', async (req, res) => {
+app.post('/api/trees/bulk', wrap(async (req, res) => {
   await ensureDb();
   const incoming = req.body;
   if (!Array.isArray(incoming)) return res.status(400).json({ error: 'Expected array' });
@@ -101,6 +109,12 @@ app.post('/api/trees/bulk', async (req, res) => {
     if (result.rowCount) count++;
   }
   res.json({ imported: count });
+}));
+
+// Global error handler — returns JSON instead of crashing
+app.use((err, _req, res, _next) => {
+  console.error(err);
+  res.status(500).json({ error: err.message || 'Internal server error' });
 });
 
 // ─── HELPERS ──────────────────────────────────────────────────────────────────
