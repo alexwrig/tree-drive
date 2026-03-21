@@ -43,6 +43,9 @@ async function ensureDb() {
 const wrap = fn => (req, res, next) => fn(req, res, next).catch(next);
 
 // ─── ROUTES ───────────────────────────────────────────────────────────────────
+app.get('/api/health', (_req, res) => {
+  res.json({ ok: true, db: !!process.env.DATABASE_URL });
+});
 app.get('/api/trees', wrap(async (_req, res) => {
   await ensureDb();
   const { rows } = await pool.query('SELECT * FROM trees ORDER BY "createdAt" DESC');
