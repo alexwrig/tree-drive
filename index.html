@@ -783,9 +783,14 @@ async function saveTree() {
 
   try {
     await api('POST', '/api/trees', t);
-    // Server broadcasts — WS onmessage handles local state
+    // Immediately show the new tree without waiting for the next poll
+    trees.unshift(t);
+    addMarker(t);
+    renderList();
+    updateStats();
     closeAdd();
     map.setView([t.lat, t.lng], Math.max(map.getZoom(), 15));
+    toast(`🌲 Tree spotted!`);
   } catch {
     toast('❌ Save failed — check connection');
   } finally {
